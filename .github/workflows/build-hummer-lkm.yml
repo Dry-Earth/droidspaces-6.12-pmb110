@@ -1,0 +1,270 @@
+name: Build hummer 6.6 LKM (Droidspaces)
+
+# 为 OnePlus Ace 5 Pro (hummer) / LineageOS 24 / 6.6.144-4k-g6350e8af3f4c
+# 编译 Droidspaces 的 KernelSU LKM 包（不刷内核）。
+#
+# 关键点：
+#   - DDK 自带的 android15-6.6 KDIR 是 6.6.127，vermagic 对不上 6.6.144，
+#     所以这里用“目标机真实 config + 精确内核 commit”自己生成 KDIR。
+#   - stock 内核是 clang r596125 编的；KCFI 对编译器敏感，默认尝试从
+#     AOSP 预编译项目下载 r596125。下载失败会自动回退到 DDK 的 r510928
+#     （vermagic 仍正确；KCFI 是否能匹配取决于内核，日志会标注）。
+#   - 最终 zip 里的 post-fs-data.sh / module.prop 已改成 hummer / 6.6.144。
+
+on:
+  workflow_dispatch:
+    inputs:
+      use_stock_clang:
+        description: '尝试使用 stock 内核的 clang r596125（失败自动回退 DDK r510928）'
+        required: true
+        type: boolean
+        default: true
+      build_network:
+        description: '同时编译 macvlan / ip6table_nat'
+        required: true
+        type: boolean
+        default: true
+      publish_release:
+        description: '构建成功后发布 Release'
+        required: true
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  KERNEL_REPO: LineageOS/android_kernel_oneplus_sm8750
+  KERNEL_SHA: 6350e8af3f4c452d087fbd6fe1aabe03cbc0af75
+  MODULES_REPO: LineageOS/android_kernel_oneplus_sm8750-modules
+  MODULES_SHA: e05c031ce1512477f2d5db7bfa26a859adfcfbc7
+  EXPECTED_RELEASE: 6.6.144-4k-g6350e8af3f4c
+  KMI: android15-6.6
+  DEVICE: hummer
+  DDK_IMAGE: ghcr.io/ylarod/ddk-min:android15-6.6-20260313
+  CLANG_REV: clang-r596125
+  CLANG_SHA: 29182889399818f97baa65ea238c80e8117981eb
+  USE_STOCK_CLANG: "0"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Free disk space
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
+
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Clone kernel source at the exact SHA
+        run: |
+          set -eux
+          mkdir -p kernel
+          cd kernel
+          git init -q
+          git remote add origin "https://github.com/${KERNEL_REPO}.git"
+          if ! git fetch --depth 1 --no-tags origin "$KERNEL_SHA"; then
+            echo "::warning::fetch by SHA failed, falling back to a deeper branch fetch"
+            git fetch --no-tags --depth 200 origin lineage-24.0
+          fi
+          git checkout -q "$KERNEL_SHA" 2>/dev/null || git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$KERNEL_SHA"
+
+      - name: Clone modules source (sibling of kernel) at the exact SHA
+        run: |
+          set -eux
+          mkdir -p sm8750-modules
+          cd sm8750-modules
+          git init -q
+          git remote add origin "https://github.com/${MODULES_REPO}.git"
+          if ! git fetch --depth 1 --no-tags origin "$MODULES_SHA"; then
+            echo "::warning::fetch by SHA failed, falling back to a deeper branch fetch"
+            git fetch --no-tags --depth 200 origin lineage-24.0
+          fi
+          git checkout -q "$MODULES_SHA" 2>/dev/null || git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$MODULES_SHA"
+
+      - name: Check for broken symlinks in kernel tree
+        run: |
+          set -eu
+          broken=0
+          while IFS= read -r link; do
+            target=$(readlink "$link")
+            case "$target" in
+              /*) resolved="$target" ;;
+              *)  resolved="$(dirname "$link")/$target" ;;
+            esac
+            if [ ! -e "$resolved" ]; then
+              echo "BROKEN: $link -> $target"
+              broken=$((broken + 1))
+            fi
+          done < <(find kernel -type l)
+          echo "broken symlinks: $broken"
+          if [ "$broken" -gt 0 ]; then
+            echo "::warning::$broken broken symlinks remain in the kernel tree"
+          fi
+
+      - name: Restore stock clang cache
+        if: ${{ inputs.use_stock_clang }}
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: clang-stock
+          key: hummer-clang-${{ env.CLANG_REV }}-${{ env.CLANG_SHA }}-v1
+
+      - name: Download stock clang r596125
+        if: ${{ inputs.use_stock_clang }}
+        run: |
+          set -eux
+          mkdir -p clang-stock
+          if [ -x clang-stock/bin/clang ]; then
+            echo "==> clang-stock 已存在，跳过下载"
+            exit 0
+          fi
+          base="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive"
+          urls="
+            ${base}/${CLANG_SHA}/${CLANG_REV}.tar.gz
+            ${base}/refs/heads/android17-release/${CLANG_REV}.tar.gz
+            ${base}/refs/heads/android17-qpr1-release/${CLANG_REV}.tar.gz
+            ${base}/refs/heads/android17-qpr2-release/${CLANG_REV}.tar.gz
+          "
+          ok=0
+          for u in $urls; do
+            echo "==> 尝试 $u"
+            if curl -fL --retry 2 --retry-all-errors --connect-timeout 20 -o /tmp/clang.tar.gz "$u"; then
+              rm -rf clang-stock
+              mkdir -p clang-stock
+              tar -xzf /tmp/clang.tar.gz -C clang-stock
+              ok=1
+              break
+            fi
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::warning::stock clang 下载失败，回退 DDK clang r510928"
+          fi
+
+      - name: Select compiler
+        run: |
+          set -eux
+          if [ -x clang-stock/bin/clang ] && clang-stock/bin/clang --version >/dev/null 2>&1; then
+            echo "USE_STOCK_CLANG=1" >> "$GITHUB_ENV"
+            clang-stock/bin/clang --version | head -n1
+          else
+            echo "USE_STOCK_CLANG=0" >> "$GITHUB_ENV"
+            echo "using DDK clang r510928"
+          fi
+
+      - name: Pull DDK toolchain
+        run: docker pull "$DDK_IMAGE"
+
+      - name: Build KDIR from exact kernel + stock config
+        env:
+          KERNELRELEASE: ${{ env.EXPECTED_RELEASE }}
+        run: |
+          set -eux
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work/kernel \
+            -e KERNELRELEASE \
+            -e USE_STOCK_CLANG \
+            "$DDK_IMAGE" \
+            bash /work/ci/build-kdir.sh
+
+      - name: Build Droidspaces LKM against that KDIR
+        env:
+          KERNELRELEASE: ${{ env.EXPECTED_RELEASE }}
+          KDIR: /work/kernel/out
+          VER: ${{ env.KMI }}
+          BUILD_NETWORK: ${{ inputs.build_network }}
+        run: |
+          set -eux
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work/src \
+            -e KERNELRELEASE \
+            -e USE_STOCK_CLANG \
+            -e KDIR \
+            -e VER \
+            -e BUILD_NETWORK \
+            "$DDK_IMAGE" \
+            bash /work/ci/build-lkm.sh
+
+      - name: Patch device guards for hummer / 6.6.144
+        run: bash ci/patch-guards.sh
+
+      - name: Package KernelSU zip
+        run: |
+          set -eux
+          command -v zip >/dev/null 2>&1 || { sudo apt-get update; sudo apt-get install -y zip; }
+          sh src/scripts/package-ksu-zip.sh
+          ls -lh src/dist
+          sha256sum src/dist/*.zip
+          unzip -l src/dist/*.zip | sed -n '1,40p'
+
+      - name: Write build info
+        run: |
+          set -eux
+          {
+            echo "device:        OnePlus Ace 5 Pro (hummer)"
+            echo "rom:           LineageOS 24.0 (20261030)"
+            echo "kernel:        ${KERNEL_REPO} @ ${KERNEL_SHA}"
+            echo "modules:       ${MODULES_REPO} @ ${MODULES_SHA}"
+            echo "release:       ${EXPECTED_RELEASE}"
+            echo "KMI:           ${KMI}"
+            echo "config:        config/hummer_config.gz (extracted from official boot.img)"
+            if [ -x clang-stock/bin/clang ]; then
+              echo "clang:         $(clang-stock/bin/clang --version | head -n1)"
+            else
+              echo "clang:         DDK clang r510928 (stock clang unavailable)"
+            fi
+            echo "network mods:  ${{ inputs.build_network }}"
+            echo
+            echo "module sha256:"
+            find src/dsm/ko -maxdepth 1 -name '*.ko' -exec sha256sum {} + | sort
+            echo
+            echo "zip sha256:"
+            sha256sum src/dist/*.zip
+          } > build-info.txt
+          cat build-info.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hummer-lkm-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            src/dist/*.zip
+            src/dsm/ko/*.ko
+            build-info.txt
+
+      - name: Publish release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          tag="hummer-lkm-${GITHUB_RUN_ID}"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" src/dist/*.zip build-info.txt -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" src/dist/*.zip build-info.txt \
+              -R "$GITHUB_REPOSITORY" \
+              --title "Droidspaces LKM for hummer / LineageOS 24 (${GITHUB_RUN_ID})" \
+              --notes-file build-info.txt
+          fi
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" --json url -q .url
