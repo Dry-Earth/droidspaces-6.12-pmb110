@@ -6,6 +6,7 @@ F=src/dsm/post-fs-data.sh
 sed -i \
   -e 's/6\.12\.69-\*/6.6.144-*/g' \
   -e 's/6\.12\.69/6.6.144/g' \
+  -e 's/vermagic-not-6\.12/vermagic-not-6.6/g' \
   -e 's/vermagic=6\.12/vermagic=6.6/g' \
   -e 's/\*PMB110\*/\*hummer*/g' \
   "$F"
