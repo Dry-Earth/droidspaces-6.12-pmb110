@@ -39,7 +39,12 @@ echo "==> key config"
 grep -E '^CONFIG_(LOCALVERSION|LOCALVERSION_AUTO|CFI_CLANG|MODVERSIONS|MODULES|MODULE_SIG_FORCE|SMP|PREEMPT)' out/.config || true
 
 # Image 生成 vmlinux / System.map；modules 生成 Module.symvers（外部模块需要）
-make O=out -j"$(nproc)" KERNELRELEASE="$KERNELRELEASE" Image modules
+ccache_arg=()
+if command -v ccache >/dev/null 2>&1; then
+  echo "==> ccache: $(ccache --version | head -n1)"
+  ccache_arg=(CC="ccache clang")
+fi
+make O=out -j"$(nproc)" KERNELRELEASE="$KERNELRELEASE" "${ccache_arg[@]}" Image modules
 
 test -s out/Module.symvers
 test -s out/System.map
