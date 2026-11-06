@@ -158,6 +158,22 @@ jobs:
             echo "::warning::stock clang 下载失败，回退 DDK clang r510928"
           fi
 
+      - name: Verify stock clang
+        id: clang-verify
+        run: |
+          if [ -x clang-stock/bin/clang ]; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save stock clang cache
+        if: ${{ inputs.use_stock_clang && steps.clang-cache.outputs.cache-hit != 'true' && steps.clang-verify.outputs.ok == '1' }}
+        uses: actions/cache/save@v4
+        with:
+          path: clang-stock
+          key: hummer-clang-${{ env.CLANG_REV }}-${{ env.CLANG_SHA }}-v1
+
       - name: Select compiler
         run: |
           set -eux
