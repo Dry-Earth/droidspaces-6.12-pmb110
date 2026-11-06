@@ -15,6 +15,14 @@ export LLVM=1
 export LLVM_IAS=1
 export CROSS_COMPILE=aarch64-linux-gnu-
 
+# 上游 modules 源码里有 #include "../../../../../../../sm8750/drivers/ufs/..."
+# LineageOS 的目录名是 kernel/oneplus/sm8750；这里内核检出在 /work/kernel，
+# 所以补一个 /work/sm8750 -> kernel 的符号链接。
+cd /work
+if [ ! -e /work/sm8750 ]; then
+  ln -s kernel /work/sm8750
+fi
+
 cd /work/kernel
 mkdir -p out
 
