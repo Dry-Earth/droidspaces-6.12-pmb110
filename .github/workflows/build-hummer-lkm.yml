@@ -20,10 +20,10 @@ on:
         type: boolean
         default: true
       build_network:
-        description: '同时编译 macvlan / ip6table_nat'
+        description: '同时编译 macvlan / ip6table_nat（上游按 6.12 写，6.6 上可能失败，失败会跳过）'
         required: true
         type: boolean
-        default: true
+        default: false
       publish_release:
         description: '构建成功后发布 Release'
         required: true
@@ -185,6 +185,14 @@ jobs:
             echo "using DDK clang r510928"
           fi
 
+      - name: Restore kernel ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: hummer-lkm-ccache-${{ env.KERNEL_SHA }}-${{ hashFiles('config/hummer_config.gz') }}-${{ env.CLANG_REV }}
+          restore-keys: |
+            hummer-lkm-ccache-${{ env.KERNEL_SHA }}-
+
       - name: Pull DDK toolchain
         run: docker pull "$DDK_IMAGE"
 
@@ -193,11 +201,17 @@ jobs:
           KERNELRELEASE: ${{ env.EXPECTED_RELEASE }}
         run: |
           set -eux
+          mkdir -p .ccache
           docker run --rm \
             -v "$PWD:/work" \
+            -v "$PWD/.ccache:/ccache" \
             -w /work/kernel \
             -e KERNELRELEASE \
             -e USE_STOCK_CLANG \
+            -e CCACHE_DIR=/ccache \
+            -e CCACHE_BASEDIR=/work/kernel \
+            -e CCACHE_COMPRESS=1 \
+            -e CCACHE_MAXSIZE=5G \
             "$DDK_IMAGE" \
             bash /work/ci/build-kdir.sh
 
