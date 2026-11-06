@@ -24,11 +24,16 @@ cd /work/src
 echo "==> build main modules"
 make -C droid_lkm KDIR="$KDIR" VER="$VER" KERNELRELEASE="$KERNELRELEASE" -j"$(nproc)"
 
-if [ "${BUILD_NETWORK:-true}" = "true" ]; then
-  echo "==> build network modules"
+if [ "${BUILD_NETWORK:-false}" = "true" ]; then
+  echo "==> build network modules (optional)"
   for m in net_macvlan net_ip6nat; do
-    make -C "$KDIR" M="/work/src/$m" KERNELRELEASE="$KERNELRELEASE" clean >/dev/null 2>&1 || true
-    make -C "$KDIR" M="/work/src/$m" KERNELRELEASE="$KERNELRELEASE" -j"$(nproc)" modules
+    if ! make -C "$KDIR" M="/work/src/$m" KERNELRELEASE="$KERNELRELEASE" clean >/dev/null 2>&1; then
+      true
+    fi
+    if ! make -C "$KDIR" M="/work/src/$m" KERNELRELEASE="$KERNELRELEASE" -j"$(nproc)" modules; then
+      echo "::warning::$m 在 6.6 上编译失败（上游按 6.12 API 写的），跳过该模块"
+      rm -f "/work/src/$m"/*.ko
+    fi
   done
 fi
 
@@ -38,7 +43,7 @@ for k in droid_lkm droid_lkm_vendor droid_lkm_misc droid_lkm_pids; do
     cp "droid_lkm/out/$VER/$k.ko" dsm/ko/
   fi
 done
-if [ "${BUILD_NETWORK:-true}" = "true" ]; then
+if [ "${BUILD_NETWORK:-false}" = "true" ]; then
   [ -f net_macvlan/macvlan.ko ] && cp net_macvlan/macvlan.ko dsm/ko/
   [ -f net_ip6nat/ip6table_nat.ko ] && cp net_ip6nat/ip6table_nat.ko dsm/ko/
 fi
